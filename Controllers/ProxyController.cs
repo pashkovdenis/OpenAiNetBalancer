@@ -36,33 +36,34 @@ namespace SerinaBalancer.Controllers
             using var reader = new StreamReader(Request.Body);
             var json = await reader.ReadToEndAsync();
 
+       
+            var isStreamRequest = json.Contains("\"stream\":true");
+ 
+            var tcs = new TaskCompletionSource<OpenAIResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+
             var req = new OpenAIRequest
             {
                 Json = json,
-                Headers = headers
+                Headers = headers,
+                Reply = tcs // ← обязательно!
             };
 
-            var isStreamRequest = json.Contains("\"stream\":true");
 
-             var result = await _manager.LoadBalancer.Ask<OpenAIResponse>(req, TimeSpan.FromSeconds(60));
+            _manager.LoadBalancer.Tell(req); // отправляем без ожидания
 
+            var result = await tcs.Task.WaitAsync(TimeSpan.FromMinutes(5)); // ждем результат
 
-            if (isStreamRequest)
+            if (json.Contains("\"stream\":true"))
             {
-
-
-                await Response.StartAsync(); 
-                await result.Stream.CopyToAsync(Response.Body);
-            }else
-            {
-                // обычный JSON-ответ
-                Response.StatusCode = 200;
-                Response.ContentType = "application/json";
+                await Response.StartAsync();
                 await result.Stream.CopyToAsync(Response.Body);
             }
-
-
-
+            else
+            {
+                Response.StatusCode = result.StatusCode;
+                Response.ContentType = "application/json";
+                await result.Stream.CopyToAsync(Response.Body);
+            } 
         }
  
 

@@ -1,4 +1,5 @@
 using Akka.Actor;
+using Microsoft.Extensions.Logging;
 using SerinaBalancer.Models;
 using System;
 using System.IO;
@@ -12,17 +13,19 @@ namespace SerinaBalancer.Actors
     {
         private readonly OpenAIEndpointConfig _config;
         private readonly HttpClient _http = new();
-
-        public AzureModelActor(OpenAIEndpointConfig config)
+        private readonly ILogger _logger;
+        public AzureModelActor(OpenAIEndpointConfig config, ILogger  logger)
         {
             _config = config;
-
+            _logger = logger;   
             ReceiveAsync<OpenAIRequest>(async req =>
             {
 
 
                 try
                 {
+
+                    _logger.LogWarning("======AZZZZZ   " + _config.Name);
 
                     var request = new HttpRequestMessage(HttpMethod.Post, _config.Url)
                     {
@@ -43,6 +46,7 @@ namespace SerinaBalancer.Actors
 
                 }catch (Exception ex)
                 {
+                    _logger.LogError(ex, " Log Azure");
                     var error = $"data: {{\"error\": \"{ex.Message}\"}}\n\ndata: [DONE]\n\n";
                     var stream = new MemoryStream(Encoding.UTF8.GetBytes(error));
                     Sender.Tell(new OpenAIResponse

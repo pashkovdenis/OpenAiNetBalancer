@@ -13,17 +13,20 @@ using OllamaSharp.Models.Chat;
 using System.Linq;
 using System.Text.Json;
 using Newtonsoft.Json.Linq;
+using Microsoft.Extensions.Logging;
 namespace SerinaBalancer.Actors
 {
     public class OllamaActor : ReceiveActor
     {
         private readonly OpenAIEndpointConfig _config;
         private readonly HttpClient _http = new();
+        private readonly ILogger _logger;
 
 
-        public OllamaActor(OpenAIEndpointConfig config)
+        public OllamaActor(OpenAIEndpointConfig config, ILogger  logger)
         {
             _config = config;
+            _logger = logger;
 
             ReceiveAsync<OpenAIRequest>(async req =>
             {
@@ -47,6 +50,9 @@ namespace SerinaBalancer.Actors
                         messages = messages,
                         stream = isStreamRequest
                     };
+
+
+                    _logger.LogWarning("OOLLAMA !!!!!!!!!!!!!!!!!!" + _config.Name);
 
                     if (isStreamRequest)
                     {
@@ -89,6 +95,7 @@ namespace SerinaBalancer.Actors
                 }
                 catch (Exception ex )
                 {
+                    _logger.LogError(ex, "error Ollma"); 
                     var error = $"data: {{\"error\": \"{ex.Message}\"}}\n\ndata: [DONE]\n\n";
                     var stream = new MemoryStream(Encoding.UTF8.GetBytes(error));
                     Sender.Tell(new OpenAIResponse

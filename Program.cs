@@ -2,6 +2,7 @@ using Akka.Actor;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using SerinaBalancer.Actors;
 using SerinaBalancer.Models;
 using System.Collections.Generic;
@@ -12,11 +13,13 @@ builder.Services.AddControllers();
 builder.Services.AddSingleton<SerinaBalancer.Actors.ActorSystemManager>();
 
 builder.Services.AddHeaderPropagation();
+builder.Services.AddLogging();  
 
 builder.Services.AddHttpClient();
 
-builder.Services.AddSingleton(_ =>
+builder.Services.AddSingleton(sp =>
 {
+   
     var configStr = @"
         akka {
             loglevel = DEBUG
@@ -26,7 +29,7 @@ builder.Services.AddSingleton(_ =>
     var system = ActorSystem.Create("SerinaBalancerSystem", hocon);
 
     var config = builder.Configuration.GetSection("OpenAIEndpoints").Get<List<OpenAIEndpointConfig>>();
-    system.ActorOf(Props.Create(() => new LoadBalancerActor(config)), "loadbalancer");
+    system.ActorOf(Props.Create(() => new LoadBalancerActor(config, sp.GetRequiredService<ILoggerFactory>().CreateLogger("Actor"))), "loadbalancer");
 
     return system; 
 

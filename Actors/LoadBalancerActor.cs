@@ -1,189 +1,129 @@
-using Akka.Actor;
-using Akka.Routing;
-using SerinaBalancer.Controllers;
+п»їusing Akka.Actor;
+using Microsoft.Extensions.Logging;
 using SerinaBalancer.Models;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
 
 namespace SerinaBalancer.Actors
 {
-
     public class LoadBalancerActor : ReceiveActor
     {
-        private class WeightedActor
+        private class ModelQueue
         {
             public IActorRef Actor { get; set; }
-            public int Weight { get; set; }
-            public int Failures { get; set; } = 0;
-            public string LastError { get; set; } = "";
+            public Channel<OpenAIRequest> Queue { get; set; }
+            public SemaphoreSlim ConcurrencyLimiter { get; set; }
+            public int InFlight => _inFlight;
+            private int _inFlight = 0;
             public DateTime LastUsedAt { get; set; } = DateTime.MinValue;
+            public int MaxConcurrent { get; set; }
 
-            public bool IsHealthy => Failures < 3;
+            public async Task Enqueue(OpenAIRequest req, ILogger logger)
+            {
+                await Queue.Writer.WriteAsync(req);
+            }
+
+            public void Increment() => Interlocked.Increment(ref _inFlight);
+            public void Decrement() => Interlocked.Decrement(ref _inFlight);
         }
 
-        private readonly List<WeightedActor> _allActors = new();
-        private readonly List<WeightedActor> _localActors = new();
-        private int _roundRobinIndex = 0;
-        private const int MaxFailures = 3;
+        private readonly List<ModelQueue> _models = new();
+        private readonly ILogger _logger;
 
-        public LoadBalancerActor(List<OpenAIEndpointConfig> endpoints)
+        public LoadBalancerActor(List<OpenAIEndpointConfig> endpoints, ILogger logger)
         {
-            
-            Receive<GetStatus>(_ =>
-            {
-                Sender.Tell(new LoadBalancerStatus
-                {
-                    Endpoints = _allActors.Select(a => new EndpointInfo
-                    {
-                        Name = a.Actor.Path.Name,
-                        Weight = a.Weight,
-                        Failures = a.Failures
-                    }).ToList()
-                });
-            });
+            _logger = logger;
 
             foreach (var ep in endpoints)
             {
-                IActorRef actor;
-                Props props;
-
-                switch (ep.Type.ToLowerInvariant())
+                var channel = Channel.CreateBounded<OpenAIRequest>(new BoundedChannelOptions(1000)
                 {
-                    case "ollama":
-                        props = Props.Create(() => new OllamaActor(ep));
-                        break;
+                    FullMode = BoundedChannelFullMode.Wait
+                });
 
-                    case "azure":
-                        props = Props.Create(() => new AzureModelActor(ep));
-                        break;
+                var actor = Context.ActorOf(
+                    ep.Type.ToLower() switch
+                    {
+                        "ollama" => Props.Create(() => new OllamaActor(ep, logger)),
+                        "azure" => Props.Create(() => new AzureModelActor(ep, logger)),
+                        _ => Props.Create(() => new AzureModelActor(ep, logger)),
+                    },
+                    $"{ep.Type.ToLower()}-{ep.Name}"
+                );
 
-                    default:
-                        props = Props.Create(() => new AzureModelActor(ep)); // fallback
-                        break;
-                }
-
-                // Оборачиваем в пул по MaxConcurrent
-                props = props.WithRouter(new SmallestMailboxPool(ep.MaxConcurrent > 0 ? ep.MaxConcurrent : 1));
-                string baseName = $"{ep.Type.ToLower()}-router-{ep.Name}";
-                string uniqueName = baseName;
-                int i = 1;
-                while (Context.Child(uniqueName) != ActorRefs.Nobody)
-                {
-                    uniqueName = $"{baseName}_{i++}";
-                }
-
-                actor = Context.ActorOf(props, uniqueName);
-
-                var wrapper = new WeightedActor
+                var model = new ModelQueue
                 {
                     Actor = actor,
-                    Weight = ep.Weight > 0 ? ep.Weight : 1
+                    Queue = channel,
+                    ConcurrencyLimiter = new SemaphoreSlim(ep.MaxConcurrent),
+                    MaxConcurrent = ep.MaxConcurrent
                 };
 
-                _allActors.Add(wrapper);
+                _models.Add(model);
 
-                if (ep.Type.Equals("ollama", StringComparison.OrdinalIgnoreCase))
-                {
-                    _localActors.Add(wrapper);
-                }
+                for (int i = 0; i < ep.MaxConcurrent; i++)
+                    StartWorker(model);
             }
-          
+
             ReceiveAsync<OpenAIRequest>(async req =>
             {
-                // Режим "только локальная модель"
-                if (req.Headers.TryGetValue("localOnly", out var v) && v.ToLower() == "true")
-                {
-                    var local = GetNext(_localActors, ref _roundRobinIndex);
-                    var responseLocal = await local.Actor.Ask<OpenAIResponse>(req);
+                var target = _models
+                  .Where(m => m.ConcurrencyLimiter.CurrentCount > 0)
+                  .OrderBy(m => m.InFlight)
+                  .ThenBy(m => m.LastUsedAt)
+                  .FirstOrDefault();
 
-                    local.LastUsedAt = DateTime.UtcNow;
-
-                    if (responseLocal.StatusCode >= 400)
-                    {
-                        local.Failures++;
-                        local.LastError = $"HTTP {responseLocal.StatusCode}";
-                    }
-                    else
-                    {
-                        local.Failures = 0;
-                        local.LastError = "";
-                    }
-
-                    // Failover даже в локальном режиме, если хотим
-                    if (responseLocal.StatusCode == 429 || responseLocal.StatusCode >= 500)
-                    {
-                        var fallback = GetNext(_localActors, ref _roundRobinIndex);
-                        var fallbackResponse = await fallback.Actor.Ask<OpenAIResponse>(req);
-                        Sender.Tell(fallbackResponse);
-                    }
-                    else
-                    {
-                        Sender.Tell(responseLocal);
-                    }
-
-                    return;
-                }
-
-                // Основной маршрут: выбираем next actor (по весу)
-                var selected = GetNext(_allActors, ref _roundRobinIndex);
-                var response = await selected.Actor.Ask<OpenAIResponse>(req);
-
-                selected.LastUsedAt = DateTime.UtcNow;
-
-                if (response.StatusCode >= 400)
-                {
-                    selected.Failures++;
-                    selected.LastError = $"HTTP {response.StatusCode}";
-                }
-                else
-                {
-                    selected.Failures = 0;
-                    selected.LastError = "";
-                }
-
-                // Failover при ошибках
-                if (response.StatusCode == 429 || response.StatusCode >= 500)
-                {
-                    var fallback = GetNext(_allActors, ref _roundRobinIndex);
-                    var fallbackResponse = await fallback.Actor.Ask<OpenAIResponse>(req);
-                    Sender.Tell(fallbackResponse);
-                }
-                else
-                {
-                    Sender.Tell(response);
-                }
+                _logger.LogInformation($"рџ“Ґ Routing to {target.Actor.Path.Name} | InFlight: {target.InFlight}");
+                await target.Enqueue(req, _logger);
             });
         }
 
-        private WeightedActor GetNext(List<WeightedActor> actors, ref int index)
+        private void StartWorker(ModelQueue model)
         {
-            var valid = actors
-                .Where(a => a.Failures < MaxFailures)
-                .SelectMany(a => Enumerable.Repeat(a, a.Weight))
-                .ToList();
+            _ = Task.Run(async () =>
+            {
+                await foreach (var req in model.Queue.Reader.ReadAllAsync())
+                {
+                    await model.ConcurrencyLimiter.WaitAsync();
+                    model.Increment();
 
-            if (valid.Count == 0)
-                return actors[index++ % actors.Count];
+                    _logger.LogInformation($"вљ™ Executing on {model.Actor.Path.Name} | InFlight: {model.InFlight}");
 
-            return valid[index++ % valid.Count];
+                    try
+                    {
+                        var sw = Stopwatch.StartNew();
+                        var response = await model.Actor.Ask<OpenAIResponse>(req, TimeSpan.FromSeconds(240));
+                        sw.Stop();
+
+                        _logger.LogInformation($"вњ… Done in {sw.ElapsedMilliseconds}ms from {model.Actor.Path.Name}");
+
+                        req.Reply?.TrySetResult(response);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"вќЊ Error in {model.Actor.Path.Name}");
+                        var fallback = new OpenAIResponse
+                        {
+                            StatusCode = 500,
+                            Stream = new System.IO.MemoryStream(System.Text.Encoding.UTF8.GetBytes(
+                                $"data: {{\"error\": \"{ex.Message}\"}}\n\ndata: [DONE]\n\n"))
+                        };
+                        req.Reply?.TrySetResult(fallback);
+                    }
+                    finally
+                    {
+                        model.LastUsedAt = DateTime.UtcNow;
+                        model.Decrement();
+                        model.ConcurrencyLimiter.Release();
+                        _logger.LogInformation($"рџ“‰ Released {model.Actor.Path.Name} | InFlight: {model.InFlight}");
+                    }
+                }
+            });
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
