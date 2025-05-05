@@ -1,3 +1,10 @@
+## 💡  UPDATES 
+
+Added smart balancing between models OpenAi Azure support. 
+Parallel Invoking models.
+
+
+
 # 🧠 Serina Ollama Proxy — OpenAI-Compatible Streaming Proxy
 
 This project is a lightweight .NET WebAPI proxy for [Ollama](https://ollama.com/) that fully supports `stream: true` chat completions — just like OpenAI.
